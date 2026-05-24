@@ -1006,7 +1006,6 @@ def causal_chunk_transition_smoothed_prev(
     gc = torch.sigmoid(chunk_gate).view(1, 1, D).to(dtype=x.dtype)
     gt = torch.sigmoid(transition_gate).view(1, 1, D).to(dtype=x.dtype)
     z = x + gc * (chunk_prefix - x) + gt * (chunk_prefix - prior_ref)
-    z = norm(z)
     return F.linear(F.relu(F.linear(z, c_fc.type_as(z))).square(), c_proj.type_as(z))
 
 class Yarn(nn.Module):
