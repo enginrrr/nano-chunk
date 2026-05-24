@@ -52,7 +52,7 @@ Run this before every launch:
 ```bash
 cd /workspace/nano-chunk
 git fetch origin master
-git reset --hard cf13ddd7f0afafaec3d81a2ac4d131b3dacdd602
+git reset --hard afca9b9475db
 
 python3 -m py_compile train_gpt_ctf.py train_gpt.py
 
@@ -117,7 +117,7 @@ c_proj_rms:0.000000
 c_proj_absmax:0.000000
 chunk_gate_mean near 0.047
 transition_gate_mean near 0.0025
-out_gate_mean near 0.006
+out_gate_mean near 0.012
 ```
 
 If step 0 is wrong, kill immediately.
