@@ -980,6 +980,7 @@ class CastedLinearT(nn.Module):
 
 def causal_chunk_transition_delta(
     x: Tensor,
+    seqlens: Tensor,
     chunk_gate: Tensor,
     transition_gate: Tensor,
     c_fc: Tensor,
@@ -987,18 +988,24 @@ def causal_chunk_transition_delta(
     chunk_size: int = 16,
 ):
     B, T, D = x.shape
-    assert T % chunk_size == 0
-    num_chunks = T // chunk_size
+    assert B == 1
 
-    chunks = x.view(B, num_chunks, chunk_size, D).float()
-    prefix_sum = chunks.cumsum(dim=2)
-    denom = torch.arange(1, chunk_size + 1, dtype=torch.float32, device=x.device).view(1, 1, chunk_size, 1)
-    chunk_prefix = (prefix_sum / denom).to(dtype=x.dtype).view(B, T, D)
+    token_idx = torch.arange(T, device=x.device)
+    doc_idx = torch.searchsorted(seqlens, token_idx.to(seqlens.dtype), right=True) - 1
+    doc_start = seqlens[doc_idx].long()
+    doc_pos = token_idx - doc_start
+    chunk_start = doc_start + (doc_pos // chunk_size) * chunk_size
+    has_prev_chunk = chunk_start > doc_start
+    prev_chunk_start = torch.where(has_prev_chunk, chunk_start - chunk_size, chunk_start)
 
-    chunk_mean = (prefix_sum[:, :, -1:, :] / chunk_size).to(dtype=x.dtype)
-    prev_chunk = torch.cat([torch.zeros_like(chunk_mean[:, :1]), chunk_mean[:, :-1]], dim=1)
-    prev_chunk = prev_chunk.view(B, num_chunks, D)
-    prev_chunk = prev_chunk[:, :, None, :].expand(B, num_chunks, chunk_size, D).reshape(B, T, D)
+    x_cumsum = torch.cat([torch.zeros(B, 1, D, dtype=torch.float32, device=x.device), x.float().cumsum(dim=1)], dim=1)
+    prefix_sum = x_cumsum[:, token_idx + 1] - x_cumsum[:, chunk_start]
+    prefix_denom = (token_idx - chunk_start + 1).view(1, T, 1).to(dtype=torch.float32)
+    chunk_prefix = (prefix_sum / prefix_denom).to(dtype=x.dtype)
+
+    prev_sum = x_cumsum[:, chunk_start] - x_cumsum[:, prev_chunk_start]
+    prev_mean = (prev_sum / chunk_size).to(dtype=x.dtype)
+    prev_chunk = torch.where(has_prev_chunk.view(1, T, 1), prev_mean, torch.zeros_like(prev_mean))
 
     gc = torch.sigmoid(chunk_gate).view(1, 1, D).to(dtype=x.dtype)
     gt = torch.sigmoid(transition_gate).view(1, 1, D).to(dtype=x.dtype)
@@ -1497,7 +1504,7 @@ class GPT(nn.Module):
                 else:
                     x = resid_lambdas_attn[i] * x + post_lambdas_attn[i] * attn_out + x0_inject[i]
 
-            x = x + causal_chunk_transition_delta(norm(x), ctf_gate[0], ctf_gate[1], ctf_fc, ctf_proj)
+            x = x + causal_chunk_transition_delta(norm(x), seqlens, ctf_gate[0], ctf_gate[1], ctf_fc, ctf_proj)
 
             if mu is not None:
                 x = mu[12] * x + mu[13] * ReLUSqrdMLP(norm(x), c_fc, c_proj)
