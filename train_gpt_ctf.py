@@ -829,6 +829,9 @@ class NorMuonAndAdam:
         else:
             p_slice = param
 
+        if p_cfg.label.startswith("ctf_"):
+            grad_chunk = torch.nan_to_num(grad_chunk.float(), nan=0.0, posinf=0.0, neginf=0.0).clamp_(-1.0, 1.0)
+
         p_state = self.param_states[param]
         p_state["step"] += 1
         t = p_state["step"]
@@ -1006,7 +1009,9 @@ def causal_chunk_transition_smoothed_prev(
     gc = torch.sigmoid(chunk_gate).view(1, 1, D).to(dtype=x.dtype)
     gt = torch.sigmoid(transition_gate).view(1, 1, D).to(dtype=x.dtype)
     z = x + gc * (chunk_prefix - x) + gt * (chunk_prefix - prior_ref)
-    return F.linear(F.relu(F.linear(z, c_fc.type_as(z))).square(), c_proj.type_as(z))
+    hidden = F.linear(z.float(), c_fc.float())
+    hidden = F.relu(hidden).clamp_max_(32.0).square_()
+    return F.linear(hidden, c_proj.float()).to(dtype=x.dtype)
 
 class Yarn(nn.Module):
     def __init__(self, head_dim, max_seq_len, paired=False):
@@ -1879,10 +1884,10 @@ class TrainingManager():
         self.param_table = {
             "qk_bank":        {"optim": "normuon", "comms": "sharded",    "adam_betas": None},
             "vo_bank":        {"optim": "normuon", "comms": "sharded",    "adam_betas": None},
-            "ctf_bank":       {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.9,  0.99], "lr_mul": 0.25, "wd_mul": 0.0},
+            "ctf_bank":       {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.9,  0.99], "lr_mul": 0.01, "wd_mul": 0.0},
             "mlp_bank":       {"optim": "normuon", "comms": "sharded",    "adam_betas": None},
-            "ctf_gates":      {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 1.0, "wd_mul": 0.0},
-            "ctf_out_gates":  {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.25, "wd_mul": 0.0},
+            "ctf_gates":      {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.01, "wd_mul": 0.0},
+            "ctf_out_gates":  {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.01, "wd_mul": 0.0},
             "scalars":        {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 5.0,  "wd_mul": 0.0},
             "smear_gate":     {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.01, "wd_mul": 0.0},
             "skip_gate":      {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.05, "wd_mul": 0.0},
@@ -2136,6 +2141,21 @@ def print_ctf_stats(step: int):
         )
 
 
+def ctf_params_are_finite(step: int) -> bool:
+    with torch.no_grad():
+        ok = (
+            torch.isfinite(raw_model.ctf_bank).all()
+            & torch.isfinite(raw_model.ctf_gates).all()
+            & torch.isfinite(raw_model.ctf_out_gates).all()
+        )
+        ok_int = ok.to(torch.int32)
+        dist.all_reduce(ok_int, op=dist.ReduceOp.MIN)
+        if not ok_int.item():
+            print0(f"non-finite CTF parameter detected at step:{step}", console=True)
+            print_ctf_stats(step)
+        return bool(ok_int.item())
+
+
 ########################################
 #            Warmup kernels            #
 ########################################
@@ -2239,6 +2259,9 @@ for step in range(train_steps + 1):
         loss.backward()
         del loss
     training_manager.step_optimizers(step)
+    if (step + 1) % 25 == 0 and not ctf_params_are_finite(step + 1):
+        print0("aborting run early due to non-finite CTF parameter", console=True)
+        raise RuntimeError("non-finite CTF parameter")
 
     # logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
