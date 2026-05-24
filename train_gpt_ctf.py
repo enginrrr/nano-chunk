@@ -833,6 +833,11 @@ class NorMuonAndAdam:
         p_state["step"] += 1
         t = p_state["step"]
 
+        if p_cfg.label.startswith("ctf_"):
+            grad_chunk = torch.nan_to_num(grad_chunk.float(), nan=0.0, posinf=1.0, neginf=-1.0).clamp_(-1.0, 1.0)
+            p_state["exp_avg"].nan_to_num_(nan=0.0, posinf=0.0, neginf=0.0)
+            p_state["exp_avg_sq"].nan_to_num_(nan=0.0, posinf=1.0, neginf=0.0)
+
         bias1, bias2 = 1 - beta1 ** t, 1 - beta2 ** t
         self._step_size_t.fill_(lr * (bias2 ** 0.5 / bias1))
         self._eff_wd_t.fill_(lr * lr * p_cfg.weight_decay * p_cfg.wd_mul)
@@ -841,6 +846,11 @@ class NorMuonAndAdam:
             p_slice, grad_chunk, p_state["exp_avg"], p_state["exp_avg_sq"],
             beta1, beta2, p_cfg.eps, self._step_size_t, self._eff_wd_t
         )
+
+        if p_cfg.label == "ctf_bank":
+            p_slice.nan_to_num_(nan=0.0, posinf=1.0, neginf=-1.0).clamp_(-1.0, 1.0)
+        elif p_cfg.label == "ctf_gates":
+            p_slice.nan_to_num_(nan=0.0, posinf=8.0, neginf=-8.0).clamp_(-8.0, 8.0)
 
         return p_slice
 
@@ -983,6 +993,7 @@ def causal_chunk_transition_delta(
     seqlens: Tensor,
     chunk_gate: Tensor,
     transition_gate: Tensor,
+    output_gate: Tensor,
     c_fc: Tensor,
     c_proj: Tensor,
     chunk_size: int = 16,
@@ -1004,15 +1015,18 @@ def causal_chunk_transition_delta(
     chunk_prefix = (prefix_sum / prefix_denom).to(dtype=x.dtype)
 
     prev_sum = x_cumsum[:, chunk_start] - x_cumsum[:, prev_chunk_start]
-    prev_mean = (prev_sum / chunk_size).to(dtype=x.dtype)
+    prev_denom = (chunk_start - prev_chunk_start).clamp_min(1).view(1, T, 1).to(dtype=torch.float32)
+    prev_mean = (prev_sum / prev_denom).to(dtype=x.dtype)
     prev_chunk = torch.where(has_prev_chunk.view(1, T, 1), prev_mean, torch.zeros_like(prev_mean))
 
     gc = torch.sigmoid(chunk_gate).view(1, 1, D).to(dtype=x.dtype)
     gt = torch.sigmoid(transition_gate).view(1, 1, D).to(dtype=x.dtype)
     z = x + gc * (chunk_prefix - x) + gt * (chunk_prefix - prev_chunk)
-    y = F.linear(z, c_fc.type_as(z))
-    y = F.relu(y).square()
-    return F.linear(y, c_proj.type_as(y))
+    y = F.linear(z.float(), c_fc.float())
+    y = F.relu(y).clamp(max=32.0).square()
+    out = F.linear(y, c_proj.float()).to(dtype=x.dtype)
+    go = (0.05 * torch.sigmoid(output_gate)).view(1, 1, D).to(dtype=x.dtype)
+    return torch.nan_to_num(go * out, nan=0.0, posinf=1.0, neginf=-1.0).clamp_(-1.0, 1.0)
 
 class Yarn(nn.Module):
     def __init__(self, head_dim, max_seq_len, paired=False):
@@ -1270,7 +1284,7 @@ class GPT(nn.Module):
         self._num_ctf_mats = num_real
         self.ctf_bank = nn.Parameter(torch.empty(num_padded, model_dim, model_dim))
         self.ctf_bank.reshape = (num_padded, model_dim, model_dim)
-        self.ctf_gates = nn.Parameter(torch.empty(num_layers, 2, model_dim))
+        self.ctf_gates = nn.Parameter(torch.empty(num_layers, 3, model_dim))
 
         std = 0.5 * model_dim ** -0.5
         bound = (3 ** 0.5) * std
@@ -1282,6 +1296,7 @@ class GPT(nn.Module):
             self.ctf_bank[num_real:].zero_()
             self.ctf_gates[:, 0, :].zero_()
             self.ctf_gates[:, 1, :].fill_(-6.0)
+            self.ctf_gates[:, 2, :].zero_()
 
     def init_mlp(self, model_dim):
         # MLP bank: stores c_fc and c_proj for all MLP layers
@@ -1504,7 +1519,7 @@ class GPT(nn.Module):
                 else:
                     x = resid_lambdas_attn[i] * x + post_lambdas_attn[i] * attn_out + x0_inject[i]
 
-            x = x + causal_chunk_transition_delta(norm(x), seqlens, ctf_gate[0], ctf_gate[1], ctf_fc, ctf_proj)
+            x = x + causal_chunk_transition_delta(norm(x), seqlens, ctf_gate[0], ctf_gate[1], ctf_gate[2], ctf_fc, ctf_proj)
 
             if mu is not None:
                 x = mu[12] * x + mu[13] * ReLUSqrdMLP(norm(x), c_fc, c_proj)
@@ -1858,7 +1873,7 @@ class TrainingManager():
         self.param_table = {
             "qk_bank":        {"optim": "normuon", "comms": "sharded",    "adam_betas": None},
             "vo_bank":        {"optim": "normuon", "comms": "sharded",    "adam_betas": None},
-            "ctf_bank":       {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.8,  0.95], "lr_mul": 5.0,  "wd_mul": 0.0},
+            "ctf_bank":       {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.8,  0.95], "lr_mul": 0.1,  "wd_mul": 0.0},
             "mlp_bank":       {"optim": "normuon", "comms": "sharded",    "adam_betas": None},
             "scalars":        {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 5.0,  "wd_mul": 0.0},
             "ctf_gates":      {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.1,  "wd_mul": 0.0},
