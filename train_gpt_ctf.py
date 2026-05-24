@@ -836,6 +836,14 @@ class NorMuonAndAdam:
         p_state["step"] += 1
         t = p_state["step"]
 
+        if p_cfg.label.startswith("ctf_"):
+            grad_chunk = torch.nan_to_num(
+                grad_chunk.float(),
+                nan=0.0,
+                posinf=1.0,
+                neginf=-1.0,
+            ).clamp_(-1.0, 1.0)
+
         bias1, bias2 = 1 - beta1 ** t, 1 - beta2 ** t
         self._step_size_t.fill_(lr * (bias2 ** 0.5 / bias1))
         self._eff_wd_t.fill_(lr * lr * p_cfg.weight_decay * p_cfg.wd_mul)
