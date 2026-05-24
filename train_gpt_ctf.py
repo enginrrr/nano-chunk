@@ -1722,7 +1722,7 @@ class Hyperparameters:
     num_scheduled_iterations: int = 1375  # number of steps to complete lr and ws schedule
     num_extension_iterations: int = 10  # number of steps to continue training at final lr and ws
     # evaluation and logging
-    run_id: str = f"{uuid.uuid4()}"
+    run_id: str = os.environ.get("NANOGPT_RUN_ID", f"{uuid.uuid4()}")
     # Descriptive run_id for this iteration:
     #   - explicit sparse connectivity refactor (no generic loop)
     #   - (1 + m_r9) * x self-reference fuse on layer 9
