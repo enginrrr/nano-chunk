@@ -839,7 +839,7 @@ class NorMuonAndAdam:
                 nan=0.0,
                 posinf=1.0,
                 neginf=-1.0,
-            ).clamp_(-1.0, 1.0)
+            ).clamp(-1.0, 1.0)
 
         bias1, bias2 = 1 - beta1 ** t, 1 - beta2 ** t
         self._step_size_t.fill_(lr * (bias2 ** 0.5 / bias1))
@@ -1015,7 +1015,7 @@ def causal_chunk_transition_smoothed_prev(
     gt = torch.sigmoid(transition_gate).view(1, 1, D).to(dtype=x.dtype)
     z = x + gc * (chunk_prefix - x) + gt * (chunk_prefix - prior_ref)
     hidden = F.linear(z.float(), c_fc.float())
-    hidden = F.relu(hidden).clamp_max_(32.0).square_()
+    hidden = F.relu(hidden).clamp_max(32.0).square()
     return F.linear(hidden, c_proj.float()).to(dtype=x.dtype)
 
 class Yarn(nn.Module):
