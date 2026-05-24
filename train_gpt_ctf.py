@@ -978,6 +978,37 @@ class CastedLinearT(nn.Module):
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the model
 
+def causal_chunk_transition_smoothed_prev(
+    x: Tensor,
+    chunk_gate: Tensor,
+    transition_gate: Tensor,
+    c_fc: Tensor,
+    c_proj: Tensor,
+    chunk_size: int = 16,
+):
+    """Chunk Transition Flow: inclusive 16-token prefix vs 0.75*r1+0.25*r2."""
+    B, T, D = x.shape
+    assert B == 1
+    assert T % chunk_size == 0
+    num_chunks = T // chunk_size
+
+    chunks = x.view(B, num_chunks, chunk_size, D).float()
+    prefix_sum = chunks.cumsum(dim=2)
+    denom = torch.arange(1, chunk_size + 1, dtype=torch.float32, device=x.device).view(1, 1, chunk_size, 1)
+    chunk_prefix = (prefix_sum / denom).to(dtype=x.dtype).view(B, T, D)
+
+    chunk_mean = (prefix_sum[:, :, -1:, :] / chunk_size).to(dtype=x.dtype)
+    prev_chunk = torch.cat([torch.zeros_like(chunk_mean[:, :1]), chunk_mean[:, :-1]], dim=1)
+    prev_prev_chunk = torch.cat([torch.zeros_like(chunk_mean[:, :2]), chunk_mean[:, :-2]], dim=1)
+    prior_ref = (0.75 * prev_chunk + 0.25 * prev_prev_chunk).view(B, num_chunks, D)
+    prior_ref = prior_ref[:, :, None, :].expand(B, num_chunks, chunk_size, D).reshape(B, T, D)
+
+    gc = torch.sigmoid(chunk_gate).view(1, 1, D).to(dtype=x.dtype)
+    gt = torch.sigmoid(transition_gate).view(1, 1, D).to(dtype=x.dtype)
+    z = x + gc * (chunk_prefix - x) + gt * (chunk_prefix - prior_ref)
+    z = norm(z)
+    return F.linear(F.relu(F.linear(z, c_fc.type_as(z))).square(), c_proj.type_as(z))
+
 class Yarn(nn.Module):
     def __init__(self, head_dim, max_seq_len, paired=False):
         super().__init__()
@@ -1169,6 +1200,7 @@ class GPT(nn.Module):
             self.embed.weight.copy_(self.lm_head.weight.T)
 
         self.init_attn(model_dim, head_dim, num_heads, num_layers, max_seq_len)
+        self.init_ctf(model_dim, num_layers)
         self.init_mlp(model_dim)
         self.init_misc(model_dim, num_layers)
         self.init_mudd(num_layers, model_dim)
@@ -1226,6 +1258,30 @@ class GPT(nn.Module):
             self.qk_bank[num_qk_groups:].zero_()
             self.vo_bank[:num_vo_real].uniform_(-bound, bound)
             self.vo_bank[num_vo_real:].zero_()
+
+    def init_ctf(self, model_dim, num_layers):
+        # Faithful port of the local best Chunk Transition Flow primitive:
+        # z = x + sigmoid(a)*(m-x) + sigmoid(b)*(m-(0.75*r1+0.25*r2)).
+        num_real = num_layers * 2 * 2  # pre/post placement, fc/proj matrix
+        num_padded = next_multiple_of_n(num_real, n=world_size)
+        self._num_ctf_mats = num_real
+        self.ctf_bank = nn.Parameter(torch.empty(num_padded, model_dim, model_dim))
+        self.ctf_bank.reshape = (num_padded, model_dim, model_dim)
+        self.ctf_gates = nn.Parameter(torch.empty(num_layers, 2, 2, model_dim))
+        self.ctf_out_gates = nn.Parameter(torch.empty(num_layers, 2))
+
+        std = 0.5 * model_dim ** -0.5
+        bound = (3 ** 0.5) * std
+        with torch.no_grad():
+            for layer in range(num_layers):
+                for placement in range(2):
+                    base = 4 * layer + 2 * placement
+                    self.ctf_bank[base].uniform_(-bound, bound)  # c_fc
+                    self.ctf_bank[base + 1].zero_()              # c_proj
+            self.ctf_bank[num_real:].zero_()
+            self.ctf_gates[:, :, 0, :].zero_()      # chunk_gate: sigmoid(0)=0.5
+            self.ctf_gates[:, :, 1, :].fill_(-6.0)  # transition_gate starts almost off
+            self.ctf_out_gates.fill_(0.0)
 
     def init_mlp(self, model_dim):
         # MLP bank: stores c_fc and c_proj for all MLP layers
@@ -1360,6 +1416,9 @@ class GPT(nn.Module):
         qk_all = self.qk_bank[:self._num_qk_groups].view(self._num_attn_layers, -1, self.qk_bank.shape[-1])
         vo_flat = self.vo_bank[:self._num_attn_layers * 2].view(self._num_attn_layers, 2, *self.vo_bank.shape[1:]).flatten(1, 2)
         attn_weights = torch.cat([qk_all, vo_flat], dim=1).unbind(0)
+        ctf_mats = self.ctf_bank[:self._num_ctf_mats].unbind(0)
+        ctf_gates = self.ctf_gates.unbind(0)
+        ctf_out_gates = self.ctf_out_gates.unbind(0)
         mlp_all = self.mlp_bank.flatten(0, 1).unbind(0)  # 24 tensors of [mlp_hdim, dim]
         mlp_fcs = mlp_all[0::2]    # even indices: c_fc
         mlp_projs = mlp_all[1::2]  # odd indices: c_proj
@@ -1398,6 +1457,15 @@ class GPT(nn.Module):
             c_fc = mlp_fcs[i]
             c_proj = mlp_projs[i]
             mu = None
+            ctf_pre_fc, ctf_pre_proj, ctf_post_fc, ctf_post_proj = ctf_mats[4 * i:4 * i + 4]
+            ctf_pre_gates = ctf_gates[i][0]
+            ctf_post_gates = ctf_gates[i][1]
+            ctf_pre_out = (0.05 * torch.sigmoid(ctf_out_gates[i][0])).to(dtype=x.dtype)
+            ctf_post_out = (0.05 * torch.sigmoid(ctf_out_gates[i][1])).to(dtype=x.dtype)
+
+            x = x + ctf_pre_out * causal_chunk_transition_smoothed_prev(
+                norm(x), ctf_pre_gates[0], ctf_pre_gates[1], ctf_pre_fc, ctf_pre_proj
+            )
 
             # Skip attention on layer 6 @YouJiacheng
             if i == 6:
@@ -1443,6 +1511,10 @@ class GPT(nn.Module):
                     x = mu[8] * x + mu[9] * attn_out + mu[10] * cache[0] + mu[11] * x0_bigram
                 else:
                     x = resid_lambdas_attn[i] * x + post_lambdas_attn[i] * attn_out + x0_inject[i]
+
+            x = x + ctf_post_out * causal_chunk_transition_smoothed_prev(
+                norm(x), ctf_post_gates[0], ctf_post_gates[1], ctf_post_fc, ctf_post_proj
+            )
 
             if mu is not None:
                 x = mu[12] * x + mu[13] * ReLUSqrdMLP(norm(x), c_fc, c_proj)
@@ -1667,7 +1739,7 @@ class Hyperparameters:
     num_scheduled_iterations: int = 1375  # number of steps to complete lr and ws schedule
     num_extension_iterations: int = 10  # number of steps to continue training at final lr and ws
     # evaluation and logging
-    run_id: str = f"{uuid.uuid4()}"
+    run_id: str = f"ctf-{uuid.uuid4()}"
     # Descriptive run_id for this iteration:
     #   - explicit sparse connectivity refactor (no generic loop)
     #   - (1 + m_r9) * x self-reference fuse on layer 9
@@ -1796,7 +1868,10 @@ class TrainingManager():
         self.param_table = {
             "qk_bank":        {"optim": "normuon", "comms": "sharded",    "adam_betas": None},
             "vo_bank":        {"optim": "normuon", "comms": "sharded",    "adam_betas": None},
+            "ctf_bank":       {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.9,  0.99], "lr_mul": 0.25, "wd_mul": 0.0},
             "mlp_bank":       {"optim": "normuon", "comms": "sharded",    "adam_betas": None},
+            "ctf_gates":      {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 1.0, "wd_mul": 0.0},
+            "ctf_out_gates":  {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.25, "wd_mul": 0.0},
             "scalars":        {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 5.0,  "wd_mul": 0.0},
             "smear_gate":     {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.01, "wd_mul": 0.0},
             "skip_gate":      {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.05, "wd_mul": 0.0},
@@ -1823,14 +1898,14 @@ class TrainingManager():
         # - Process smaller/faster params first while large reduces complete
         # - lm_head must complete before embed sync (when tied)
         self.work_order = [
-            "scalars", "smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank", "mudd_b2", "xsa_alphas",
+            "scalars", "ctf_gates", "ctf_out_gates", "smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank", "mudd_b2", "xsa_alphas",
             "post_lambdas", "x0_lambdas", "bigram_lambdas", "resid_lambdas",  # Small, fast
         ] + [
             "mudd_w2",
             "value_embeds", "bigram_embed",  # Medium
             "mudd_w1",
             "lm_head", "embed",   # lm_head must complete before embed sync (when tied)
-            "qk_bank", "vo_bank", "mlp_bank",  # Large, polar express - process last to maximize overlap
+            "qk_bank", "vo_bank", "ctf_bank", "mlp_bank",  # Large, polar express - process last to maximize overlap
         ]
 
         adam_defaults = dict(
@@ -2015,6 +2090,7 @@ model.attn_gate_bank.data = model.attn_gate_bank.data.bfloat16()
 model.ve_gate_bank.data = model.ve_gate_bank.data.bfloat16()
 model.qk_bank.data = model.qk_bank.data.bfloat16()
 model.vo_bank.data = model.vo_bank.data.bfloat16()
+model.ctf_bank.data = model.ctf_bank.data.bfloat16()
 model.mlp_bank.data = model.mlp_bank.data.bfloat16()
 model.mudd_w1.data = model.mudd_w1.data.bfloat16()
 model.mudd_w2.data = model.mudd_w2.data.bfloat16()
@@ -2022,8 +2098,31 @@ model.mudd_b2.data = model.mudd_b2.data.bfloat16()
 for param in model.parameters():
     dist.broadcast(param.detach(), 0)
 
-model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
+raw_model = model
+model: nn.Module = torch.compile(raw_model, dynamic=False, fullgraph=True)
 training_manager = TrainingManager(model)
+
+
+def print_ctf_stats(step: int):
+    if not master_process:
+        return
+    with torch.no_grad():
+        bank = raw_model.ctf_bank[:raw_model._num_ctf_mats].detach().float()
+        c_proj = bank[1::2]
+        gates = torch.sigmoid(raw_model.ctf_gates.detach().float())
+        out = torch.sigmoid(raw_model.ctf_out_gates.detach().float())
+        print0(
+            f"ctf_stats step:{step} "
+            f"bank_rms:{bank.square().mean().sqrt().item():.6f} "
+            f"bank_absmax:{bank.abs().max().item():.6f} "
+            f"c_proj_rms:{c_proj.square().mean().sqrt().item():.6f} "
+            f"c_proj_absmax:{c_proj.abs().max().item():.6f} "
+            f"chunk_gate_mean:{gates[:, :, 0, :].mean().item():.6f} "
+            f"transition_gate_mean:{gates[:, :, 1, :].mean().item():.6f} "
+            f"out_gate_mean:{out.mean().item():.6f} "
+            f"out_gate_max:{out.max().item():.6f}",
+            console=True,
+        )
 
 
 ########################################
@@ -2097,8 +2196,16 @@ for step in range(train_steps + 1):
                 val_loss += model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()).mean()
         val_loss /= val_steps
         del val_loader
+        bad_val_loss = (~torch.isfinite(val_loss)).to(torch.int32)
+        dist.all_reduce(bad_val_loss, op=dist.ReduceOp.MAX)
         dist.reduce(val_loss, 0, op=dist.ReduceOp.AVG)
         print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
+        print_ctf_stats(step)
+        if bad_val_loss.item():
+            print0("non-finite validation loss detected; aborting run early to preserve budget", console=True)
+            print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
+                   f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
+            raise RuntimeError("non-finite validation loss")
         model.train()
         # start the clock again
         torch.cuda.synchronize()
