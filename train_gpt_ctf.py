@@ -1280,7 +1280,9 @@ class GPT(nn.Module):
             self.ctf_bank[num_real:].zero_()
             self.ctf_gates[:, :, 0, :].zero_()      # chunk_gate: sigmoid(0)=0.5
             self.ctf_gates[:, :, 1, :].fill_(-6.0)  # transition_gate starts almost off
-            self.ctf_out_gates.fill_(0.0)
+            # Start CTF as a small residual branch; c_proj is zero-init, but once it
+            # starts learning this keeps the new path inside the baseline scale budget.
+            self.ctf_out_gates.fill_(-2.0)
         self.active_ctf_layers = {0, 1, 2, 3}
 
     def init_mlp(self, model_dim):
@@ -1460,11 +1462,12 @@ class GPT(nn.Module):
             ctf_pre_fc, ctf_pre_proj, ctf_post_fc, ctf_post_proj = ctf_mats[4 * i:4 * i + 4]
             ctf_pre_gates = ctf_gates[i][0]
             ctf_post_gates = ctf_gates[i][1]
-            ctf_pre_out = (0.05 * torch.sigmoid(ctf_out_gates[i][0])).to(dtype=x.dtype)
-            ctf_post_out = (0.05 * torch.sigmoid(ctf_out_gates[i][1])).to(dtype=x.dtype)
+            ctf_pre_out = (0.01 * torch.sigmoid(ctf_out_gates[i][0])).to(dtype=x.dtype)
+            ctf_post_out = (0.01 * torch.sigmoid(ctf_out_gates[i][1])).to(dtype=x.dtype)
 
+            ctf_pre = None
             if i in self.active_ctf_layers:
-                x = x + ctf_pre_out * causal_chunk_transition_smoothed_prev(
+                ctf_pre = ctf_pre_out * causal_chunk_transition_smoothed_prev(
                     norm(x), ctf_pre_gates[0], ctf_pre_gates[1], ctf_pre_fc, ctf_pre_proj
                 )
 
@@ -1511,17 +1514,23 @@ class GPT(nn.Module):
                 if mu is not None:
                     x = mu[8] * x + mu[9] * attn_out + mu[10] * cache[0] + mu[11] * x0_bigram
                 else:
+                    if ctf_pre is not None:
+                        attn_out = attn_out + ctf_pre
                     x = resid_lambdas_attn[i] * x + post_lambdas_attn[i] * attn_out + x0_inject[i]
 
+            ctf_post = None
             if i in self.active_ctf_layers:
-                x = x + ctf_post_out * causal_chunk_transition_smoothed_prev(
+                ctf_post = ctf_post_out * causal_chunk_transition_smoothed_prev(
                     norm(x), ctf_post_gates[0], ctf_post_gates[1], ctf_post_fc, ctf_post_proj
                 )
 
+            mlp_out = ReLUSqrdMLP(norm(x), c_fc, c_proj)
+            if ctf_post is not None:
+                mlp_out = mlp_out + ctf_post
             if mu is not None:
-                x = mu[12] * x + mu[13] * ReLUSqrdMLP(norm(x), c_fc, c_proj)
+                x = mu[12] * x + mu[13] * mlp_out
             else:
-                x = resid_lambdas_mlp[i] * x + post_lambdas_mlp[i] * ReLUSqrdMLP(norm(x), c_fc, c_proj)
+                x = resid_lambdas_mlp[i] * x + post_lambdas_mlp[i] * mlp_out
 
             if i in self.cache_layers:
                 cache[i] = x
