@@ -834,7 +834,8 @@ class NorMuonAndAdam:
         t = p_state["step"]
 
         if p_cfg.label.startswith("ctf_"):
-            grad_chunk = torch.nan_to_num(grad_chunk.float(), nan=0.0, posinf=1.0, neginf=-1.0).clamp_(-1.0, 1.0)
+            grad_chunk = torch.nan_to_num(grad_chunk.float(), nan=0.0, posinf=1.0, neginf=-1.0)
+            grad_chunk = grad_chunk.clamp(-1.0, 1.0)
             p_state["exp_avg"].nan_to_num_(nan=0.0, posinf=0.0, neginf=0.0)
             p_state["exp_avg_sq"].nan_to_num_(nan=0.0, posinf=1.0, neginf=0.0)
 
@@ -848,9 +849,11 @@ class NorMuonAndAdam:
         )
 
         if p_cfg.label == "ctf_bank":
-            p_slice.nan_to_num_(nan=0.0, posinf=1.0, neginf=-1.0).clamp_(-1.0, 1.0)
+            p_slice.nan_to_num_(nan=0.0, posinf=1.0, neginf=-1.0)
+            p_slice.clamp_(-1.0, 1.0)
         elif p_cfg.label == "ctf_gates":
-            p_slice.nan_to_num_(nan=0.0, posinf=8.0, neginf=-8.0).clamp_(-8.0, 8.0)
+            p_slice.nan_to_num_(nan=0.0, posinf=8.0, neginf=-8.0)
+            p_slice.clamp_(-8.0, 8.0)
 
         return p_slice
 
@@ -1009,7 +1012,8 @@ def causal_chunk_transition_delta(
     has_prev_chunk = chunk_start > doc_start
     prev_chunk_start = torch.where(has_prev_chunk, chunk_start - chunk_size, chunk_start)
 
-    x_cumsum = torch.cat([torch.zeros(B, 1, D, dtype=torch.float32, device=x.device), x.float().cumsum(dim=1)], dim=1)
+    # H10 defense: cumsum in fp64 to keep precision at val T=262144 (catastrophic-cancellation safe).
+    x_cumsum = torch.cat([torch.zeros(B, 1, D, dtype=torch.float64, device=x.device), x.double().cumsum(dim=1)], dim=1).float()
     prefix_sum = x_cumsum[:, token_idx + 1] - x_cumsum[:, chunk_start]
     prefix_denom = (token_idx - chunk_start + 1).view(1, T, 1).to(dtype=torch.float32)
     chunk_prefix = (prefix_sum / prefix_denom).to(dtype=x.dtype)
@@ -1026,7 +1030,8 @@ def causal_chunk_transition_delta(
     y = F.relu(y).clamp(max=32.0).square()
     out = F.linear(y, c_proj.float()).to(dtype=x.dtype)
     go = (0.05 * torch.sigmoid(output_gate)).view(1, 1, D).to(dtype=x.dtype)
-    return torch.nan_to_num(go * out, nan=0.0, posinf=1.0, neginf=-1.0).clamp_(-1.0, 1.0)
+    out_safe = torch.nan_to_num(go * out, nan=0.0, posinf=1.0, neginf=-1.0)
+    return out_safe.clamp(-1.0, 1.0)
 
 class Yarn(nn.Module):
     def __init__(self, head_dim, max_seq_len, paired=False):
@@ -1294,9 +1299,11 @@ class GPT(nn.Module):
                 self.ctf_bank[base].uniform_(-bound, bound)
                 self.ctf_bank[base + 1].zero_()
             self.ctf_bank[num_real:].zero_()
-            self.ctf_gates[:, 0, :].zero_()
-            self.ctf_gates[:, 1, :].fill_(-6.0)
-            self.ctf_gates[:, 2, :].zero_()
+            # Init: CTF starts as small but real perturbation; c_proj is zero-init so step-0 output is exactly 0.
+            # All three gates receive gradient; the model can grow any of them if the mechanism is useful.
+            self.ctf_gates[:, 0, :].fill_(-3.0)   # chunk_gate; sigmoid(-3) ~= 0.047 -> ~5% chunk blend
+            self.ctf_gates[:, 1, :].fill_(-6.0)   # transition_gate; sigmoid(-6) ~= 0.0025; preserved from d4 winner
+            self.ctf_gates[:, 2, :].fill_(-2.0)   # output_gate; sigmoid(-2) ~= 0.119 -> effective output scale ~= 0.006
 
     def init_mlp(self, model_dim):
         # MLP bank: stores c_fc and c_proj for all MLP layers
@@ -1519,7 +1526,10 @@ class GPT(nn.Module):
                 else:
                     x = resid_lambdas_attn[i] * x + post_lambdas_attn[i] * attn_out + x0_inject[i]
 
-            x = x + causal_chunk_transition_delta(norm(x), seqlens, ctf_gate[0], ctf_gate[1], ctf_gate[2], ctf_fc, ctf_proj)
+            # CTF only at cache layers 3 and 7 for the one-shot.
+            # Two integration points: enough to test the chunking mechanism, not 11x risk surface.
+            if i in (3, 7):
+                x = x + causal_chunk_transition_delta(norm(x), seqlens, ctf_gate[0], ctf_gate[1], ctf_gate[2], ctf_fc, ctf_proj)
 
             if mu is not None:
                 x = mu[12] * x + mu[13] * ReLUSqrdMLP(norm(x), c_fc, c_proj)
@@ -2094,7 +2104,8 @@ model.attn_gate_bank.data = model.attn_gate_bank.data.bfloat16()
 model.ve_gate_bank.data = model.ve_gate_bank.data.bfloat16()
 model.qk_bank.data = model.qk_bank.data.bfloat16()
 model.vo_bank.data = model.vo_bank.data.bfloat16()
-model.ctf_bank.data = model.ctf_bank.data.bfloat16()
+# ctf_bank stays fp32: Adam-managed param, grads must not overflow bf16.
+# Costs ~26MB extra memory; eliminates bf16 grad overflow path (H9).
 model.mlp_bank.data = model.mlp_bank.data.bfloat16()
 model.mudd_w1.data = model.mudd_w1.data.bfloat16()
 model.mudd_w2.data = model.mudd_w2.data.bfloat16()
@@ -2102,7 +2113,35 @@ model.mudd_b2.data = model.mudd_b2.data.bfloat16()
 for param in model.parameters():
     dist.broadcast(param.detach(), 0)
 
-model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
+raw_model = model
+model: nn.Module = torch.compile(raw_model, dynamic=False, fullgraph=True)
+
+def print_ctf_stats(step: int):
+    """Per-checkpoint diagnostic on CTF state. Always call from val block."""
+    if not dist.is_initialized() or dist.get_rank() != 0:
+        return
+    with torch.no_grad():
+        bank = raw_model.ctf_bank[:raw_model._num_ctf_mats].detach().float()
+        gates = raw_model.ctf_gates.detach().float()
+        bank_rms = bank.pow(2).mean().sqrt().item()
+        bank_max = bank.abs().max().item()
+        c_proj = bank[1::2]  # odd indices are c_proj
+        c_proj_rms = c_proj.pow(2).mean().sqrt().item()
+        c_proj_max = c_proj.abs().max().item()
+        chunk_gate_mean = torch.sigmoid(gates[:, 0, :]).mean().item()
+        trans_gate_mean = torch.sigmoid(gates[:, 1, :]).mean().item()
+        out_gate_eff = 0.05 * torch.sigmoid(gates[:, 2, :])
+        out_gate_mean = out_gate_eff.mean().item()
+        out_gate_max = out_gate_eff.max().item()
+    print(
+        f"ctf_stats step:{step} "
+        f"bank_rms:{bank_rms:.6f} bank_absmax:{bank_max:.6f} "
+        f"c_proj_rms:{c_proj_rms:.6f} c_proj_absmax:{c_proj_max:.6f} "
+        f"chunk_gate_mean:{chunk_gate_mean:.6f} transition_gate_mean:{trans_gate_mean:.6f} "
+        f"out_gate_mean:{out_gate_mean:.6f} out_gate_max:{out_gate_max:.6f}",
+        flush=True,
+    )
+
 training_manager = TrainingManager(model)
 
 
@@ -2170,6 +2209,8 @@ for step in range(train_steps + 1):
         assert args.val_tokens % args.val_batch_size == 0
         val_steps = grad_accum_steps * args.val_tokens // args.val_batch_size
         val_loader = distributed_data_generator(args.val_files, args.val_batch_size, -1, grad_accum_steps=grad_accum_steps, align_to_bos=False)
+        # H8 defense: ensure all sharded all_gathers (including ctf_bank) have completed before val forwards.
+        dist.barrier()
         val_loss = 0
         with torch.no_grad():
             for _ in range(val_steps):
@@ -2177,8 +2218,13 @@ for step in range(train_steps + 1):
                 val_loss += model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()).mean()
         val_loss /= val_steps
         del val_loader
+        bad_val_loss = (~torch.isfinite(val_loss)).to(torch.int32)
+        dist.all_reduce(bad_val_loss, op=dist.ReduceOp.MAX)
         dist.reduce(val_loss, 0, op=dist.ReduceOp.AVG)
         print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
+        print_ctf_stats(step)
+        if bad_val_loss.item():
+            raise RuntimeError(f"non-finite validation loss at step {step}; aborting to preserve budget")
         model.train()
         # start the clock again
         torch.cuda.synchronize()
