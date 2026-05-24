@@ -991,6 +991,8 @@ class CastedLinearT(nn.Module):
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the model
 
+CTF_OUTPUT_SCALE = 0.10
+
 def causal_chunk_transition_delta(
     x: Tensor,
     seqlens: Tensor,
@@ -1029,7 +1031,7 @@ def causal_chunk_transition_delta(
     y = F.linear(z.float(), c_fc.float())
     y = F.relu(y).clamp(max=32.0).square()
     out = F.linear(y, c_proj.float()).to(dtype=x.dtype)
-    go = (0.05 * torch.sigmoid(output_gate)).view(1, 1, D).to(dtype=x.dtype)
+    go = (CTF_OUTPUT_SCALE * torch.sigmoid(output_gate)).view(1, 1, D).to(dtype=x.dtype)
     out_safe = torch.nan_to_num(go * out, nan=0.0, posinf=1.0, neginf=-1.0)
     return out_safe.clamp(-1.0, 1.0)
 
@@ -1303,7 +1305,7 @@ class GPT(nn.Module):
             # All three gates receive gradient; the model can grow any of them if the mechanism is useful.
             self.ctf_gates[:, 0, :].fill_(-3.0)   # chunk_gate; sigmoid(-3) ~= 0.047 -> ~5% chunk blend
             self.ctf_gates[:, 1, :].fill_(-6.0)   # transition_gate; sigmoid(-6) ~= 0.0025; preserved from d4 winner
-            self.ctf_gates[:, 2, :].fill_(-2.0)   # output_gate; sigmoid(-2) ~= 0.119 -> effective output scale ~= 0.006
+            self.ctf_gates[:, 2, :].fill_(-2.0)   # output_gate; sigmoid(-2) ~= 0.119 -> effective output scale ~= 0.012
 
     def init_mlp(self, model_dim):
         # MLP bank: stores c_fc and c_proj for all MLP layers
@@ -1883,10 +1885,10 @@ class TrainingManager():
         self.param_table = {
             "qk_bank":        {"optim": "normuon", "comms": "sharded",    "adam_betas": None},
             "vo_bank":        {"optim": "normuon", "comms": "sharded",    "adam_betas": None},
-            "ctf_bank":       {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.8,  0.95], "lr_mul": 0.1,  "wd_mul": 0.0},
+            "ctf_bank":       {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.8,  0.95], "lr_mul": 0.2,  "wd_mul": 0.0},
             "mlp_bank":       {"optim": "normuon", "comms": "sharded",    "adam_betas": None},
             "scalars":        {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 5.0,  "wd_mul": 0.0},
-            "ctf_gates":      {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.1,  "wd_mul": 0.0},
+            "ctf_gates":      {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.2,  "wd_mul": 0.0},
             "smear_gate":     {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.01, "wd_mul": 0.0},
             "skip_gate":      {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.05, "wd_mul": 0.0},
             "attn_gate_bank": {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99]},
@@ -2130,7 +2132,7 @@ def print_ctf_stats(step: int):
         c_proj_max = c_proj.abs().max().item()
         chunk_gate_mean = torch.sigmoid(gates[:, 0, :]).mean().item()
         trans_gate_mean = torch.sigmoid(gates[:, 1, :]).mean().item()
-        out_gate_eff = 0.05 * torch.sigmoid(gates[:, 2, :])
+        out_gate_eff = CTF_OUTPUT_SCALE * torch.sigmoid(gates[:, 2, :])
         out_gate_mean = out_gate_eff.mean().item()
         out_gate_max = out_gate_eff.max().item()
     print(
