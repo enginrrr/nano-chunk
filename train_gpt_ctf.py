@@ -1281,6 +1281,7 @@ class GPT(nn.Module):
             self.ctf_gates[:, :, 0, :].zero_()      # chunk_gate: sigmoid(0)=0.5
             self.ctf_gates[:, :, 1, :].fill_(-6.0)  # transition_gate starts almost off
             self.ctf_out_gates.fill_(0.0)
+        self.active_ctf_layers = {0, 1, 2, 3}
 
     def init_mlp(self, model_dim):
         # MLP bank: stores c_fc and c_proj for all MLP layers
@@ -1462,9 +1463,10 @@ class GPT(nn.Module):
             ctf_pre_out = (0.05 * torch.sigmoid(ctf_out_gates[i][0])).to(dtype=x.dtype)
             ctf_post_out = (0.05 * torch.sigmoid(ctf_out_gates[i][1])).to(dtype=x.dtype)
 
-            x = x + ctf_pre_out * causal_chunk_transition_smoothed_prev(
-                norm(x), ctf_pre_gates[0], ctf_pre_gates[1], ctf_pre_fc, ctf_pre_proj
-            )
+            if i in self.active_ctf_layers:
+                x = x + ctf_pre_out * causal_chunk_transition_smoothed_prev(
+                    norm(x), ctf_pre_gates[0], ctf_pre_gates[1], ctf_pre_fc, ctf_pre_proj
+                )
 
             # Skip attention on layer 6 @YouJiacheng
             if i == 6:
@@ -1511,9 +1513,10 @@ class GPT(nn.Module):
                 else:
                     x = resid_lambdas_attn[i] * x + post_lambdas_attn[i] * attn_out + x0_inject[i]
 
-            x = x + ctf_post_out * causal_chunk_transition_smoothed_prev(
-                norm(x), ctf_post_gates[0], ctf_post_gates[1], ctf_post_fc, ctf_post_proj
-            )
+            if i in self.active_ctf_layers:
+                x = x + ctf_post_out * causal_chunk_transition_smoothed_prev(
+                    norm(x), ctf_post_gates[0], ctf_post_gates[1], ctf_post_fc, ctf_post_proj
+                )
 
             if mu is not None:
                 x = mu[12] * x + mu[13] * ReLUSqrdMLP(norm(x), c_fc, c_proj)
@@ -1738,7 +1741,7 @@ class Hyperparameters:
     num_scheduled_iterations: int = 1375  # number of steps to complete lr and ws schedule
     num_extension_iterations: int = 10  # number of steps to continue training at final lr and ws
     # evaluation and logging
-    run_id: str = f"ctf-{uuid.uuid4()}"
+    run_id: str = f"ctf-layer4-{uuid.uuid4()}"
     # Descriptive run_id for this iteration:
     #   - explicit sparse connectivity refactor (no generic loop)
     #   - (1 + m_r9) * x self-reference fuse on layer 9
