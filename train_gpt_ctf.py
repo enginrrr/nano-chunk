@@ -1858,7 +1858,7 @@ class TrainingManager():
         self.param_table = {
             "qk_bank":        {"optim": "normuon", "comms": "sharded",    "adam_betas": None},
             "vo_bank":        {"optim": "normuon", "comms": "sharded",    "adam_betas": None},
-            "ctf_bank":       {"optim": "normuon", "comms": "sharded",    "adam_betas": None},
+            "ctf_bank":       {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.8,  0.95], "lr_mul": 5.0,  "wd_mul": 0.0},
             "mlp_bank":       {"optim": "normuon", "comms": "sharded",    "adam_betas": None},
             "scalars":        {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 5.0,  "wd_mul": 0.0},
             "ctf_gates":      {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.1,  "wd_mul": 0.0},
