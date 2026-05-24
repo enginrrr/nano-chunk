@@ -829,9 +829,6 @@ class NorMuonAndAdam:
         else:
             p_slice = param
 
-        if p_cfg.label.startswith("ctf_"):
-            grad_chunk = torch.nan_to_num(grad_chunk.float(), nan=0.0, posinf=0.0, neginf=0.0).clamp_(-1.0, 1.0)
-
         p_state = self.param_states[param]
         p_state["step"] += 1
         t = p_state["step"]
